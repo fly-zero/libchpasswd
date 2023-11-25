@@ -1,5 +1,6 @@
 #include <bits/types/FILE.h>
 #include <crypt.h>
+#include <exception>
 #include <pwd.h>
 #include <shadow.h>
 #include <sys/stat.h>
@@ -10,10 +11,11 @@
 #include <cstring>
 
 #include <memory>
+#include <optional>
+#include <string>
 #include <system_error>
 #include <utility>
 #include <vector>
-#include <string>
 
 #include "chpasswd.h"
 
@@ -170,6 +172,13 @@ protected:
     static bool create_backup(
         const char * root_path, const char * dst_name, FILE * src_fp, const struct stat & src_st);
 
+    static bool write_file(const char * root_path,
+                           const char * temp_name,
+                           const char * path,
+                           const struct stat & src_st,
+                           bool (*op)(FILE *, void *),
+                           void * user);
+
 private:
     std::string passwd_path_;
     std::string shadow_path_;
@@ -323,63 +332,35 @@ inline bool chpasswd_context::create_shadow_backup(const char * root_path) {
 }
 
 bool chpasswd_context::write_passwd(const char * root_path) {
-    // 创建临时 passwd 文件
-    auto const temp_path = root_path + std::string("/etc/passwd+");
-    file_ptr fp{open_file_perms(temp_path.c_str(), "w", passwd_st_)};
-    if (!fp) {
-        return false;
-    }
-
-    // 写入临时 passwd 文件
-    for (auto & pwd : pwds_) {
-        if (putpwent(&pwd, fp.get()) != 0) {
-            return false;
-        }
-    }
-
-    // 刷新 passwd 文件
-    fflush(fp.get());
-    fsync(fileno(fp.get()));
-
-    // 关闭 passwd 文件
-    passwd_fp_.reset();
-
-    // 重命名临时 passwd 文件
-    if (rename(temp_path.c_str(), passwd_path_.c_str()) != 0) {
-        return false;
-    }
-
-    return true;
+    auto const op = [](FILE * fp, void * user) {
+                        auto const ctx = static_cast<chpasswd_context *>(user);
+                        ctx->passwd_fp_.reset();
+                        auto & pwds = ctx->pwds_;
+                        for (auto & pwd : pwds) {
+                            if (putpwent(&pwd, fp) != 0) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    };
+    return write_file(
+        root_path, "/etc/passwd+", passwd_path_.c_str(), passwd_st_, op, this);
 }
 
 bool chpasswd_context::write_shadow(const char * root_path) {
-    // 创建临时 shadow 文件
-    auto const temp_path = root_path + std::string("/etc/shadow+");
-    file_ptr fp{open_file_perms(temp_path.c_str(), "w", shadow_st_)};
-    if (!fp) {
-        return false;
-    }
-
-    // 写入临时 shadow 文件
-    for (auto & spwd : spwds_) {
-        if (putspent(&spwd, fp.get()) != 0) {
-            return false;
-        }
-    }
-
-    // 刷新 shadow 文件
-    fflush(fp.get());
-    fsync(fileno(fp.get()));
-
-    // 关闭 shadow 文件
-    shadow_fp_.reset();
-
-    // 重命名临时 shadow 文件
-    if (rename(temp_path.c_str(), shadow_path_.c_str()) != 0) {
-        return false;
-    }
-
-    return true;
+    auto const op = [](FILE * fp, void * user) {
+                        auto const ctx = static_cast<chpasswd_context *>(user);
+                        ctx->shadow_fp_.reset();
+                        auto & spwds = ctx->spwds_;
+                        for (auto & spwd : spwds) {
+                            if (putspent(&spwd, fp) != 0) {
+                                return false;
+                            }
+                        }
+                        return true;
+                    };
+    return write_file(
+        root_path, "/etc/shadow+", shadow_path_.c_str(), shadow_st_, op, this);
 }
 
 inline std::vector<my_passwd> chpasswd_context::load_passwd(FILE * fp) {
@@ -466,13 +447,49 @@ fail:
     return false;
 }
 
+inline bool chpasswd_context::write_file(
+    const char * root_path,
+    const char * temp_name,
+    const char * path,
+    const struct stat & src_st,
+    bool (*op)(FILE *, void *),
+    void * user) {
+   // 创建临时文件
+    auto const temp_path = std::string(root_path) + temp_name;
+    file_ptr fp{open_file_perms(temp_path.c_str(), "w", src_st)};
+    if (!fp) {
+        return false;
+    }
+
+    // 写入临时文件
+    if (!op(fp.get(), user)) {
+        return false;
+    }
+
+    // 刷新临时文件
+    fflush(fp.get());
+    fsync(fileno(fp.get()));
+
+    // 重命名临时 shadow 文件
+    if (rename(temp_path.c_str(), path) != 0) {
+        return false;
+    }
+
+    return true;
+}
+
 bool chpasswd(const char * root_path, const char * username, const char * password) {
 
-    // 构造上下文
-    chpasswd_context ctx{root_path};
+    std::optional<chpasswd_context> ctx;
+
+    try {
+        ctx.emplace(root_path);
+    } catch (std::exception const & e) {
+        return false;
+    }
 
     // 以用户名查找 pwd
-    auto const pwd = ctx.find_passwd(username);
+    auto const pwd = ctx->find_passwd(username);
     if (!pwd) {
         return false; // 用户不存在
     }
@@ -484,7 +501,7 @@ bool chpasswd(const char * root_path, const char * username, const char * passwo
     auto const hash = crypt(password, salt);
 
     // 以用户名查找 spwd
-    auto const sp = ctx.find_spwd(username);
+    auto const sp = ctx->find_spwd(username);
 
     // 更新 shadow 纪录
     bool update_shadow = false;
@@ -507,22 +524,22 @@ bool chpasswd(const char * root_path, const char * username, const char * passwo
 
     // 更新 shadow 文件
     if (update_shadow) {
-        if (!ctx.create_shadow_backup(root_path)) {
+        if (!ctx->create_shadow_backup(root_path)) {
             return false;
         }
 
-        if (!ctx.write_shadow(root_path)) {
+        if (!ctx->write_shadow(root_path)) {
             return false;
         }
     }
 
     // 更新 passwd 文件
     if (update_passwd) {
-        if (!ctx.create_passwd_backup(root_path)) {
+        if (!ctx->create_passwd_backup(root_path)) {
             return false;
         }
 
-        if (!ctx.write_passwd(root_path)) {
+        if (!ctx->write_passwd(root_path)) {
             return false;
         }
     }
