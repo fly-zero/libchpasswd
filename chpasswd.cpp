@@ -19,7 +19,7 @@
 
 #include "chpasswd.h"
 
-class my_passwd : public passwd {
+class my_passwd : private passwd {
 public:
     explicit my_passwd(const passwd & pw);
 
@@ -32,9 +32,17 @@ public:
     my_passwd & operator=(my_passwd && other) noexcept;
 
     ~my_passwd();
+
+    const char * get_pw_name() const noexcept { return pw_name; }
+
+    const char * get_pw_passwd() const noexcept { return pw_passwd; }
+
+    void set_pw_passwd(const char * passwd) noexcept;
+
+    int write(FILE * fp) const noexcept { return putpwent(this, fp); }
 };
 
-class my_spwd : public spwd {
+class my_spwd : private spwd {
 public:
     explicit my_spwd(const spwd & sp);
 
@@ -47,6 +55,14 @@ public:
     my_spwd & operator=(my_spwd && other) noexcept;
 
     ~my_spwd();
+
+    const char * get_sp_namp() const noexcept { return sp_namp; }
+
+    void set_sp_pwdp(const char * pwdp) noexcept;
+
+    void set_sp_lstchg() noexcept;
+
+    int write(FILE * fp) const noexcept { return putspent(this, fp); }
 };
 
 class chpasswd_context {
@@ -67,7 +83,7 @@ public:
      * @param username 用户名
      * @return passwd* passwd 纪录
      */
-    passwd * find_passwd(const char * username);
+    my_passwd * find_passwd(const char * username);
 
     /**
      * @brief 查找 spwd 纪录
@@ -75,7 +91,7 @@ public:
      * @param username 用户名
      * @return passwd* passwd 纪录
      */
-    spwd * find_spwd(const char * username);
+    my_spwd * find_spwd(const char * username);
 
     /**
      * @brief 创建 passwd 备份文件
@@ -238,6 +254,11 @@ inline my_passwd::~my_passwd() {
     free(pw_shell);
 }
 
+inline void my_passwd::set_pw_passwd(const char * passwd) noexcept {
+    free(pw_passwd);
+    pw_passwd = strdup(passwd);
+}
+
 inline my_spwd::my_spwd(const spwd & sp) {
     sp_namp = strdup(sp.sp_namp);
     sp_pwdp = strdup(sp.sp_pwdp);
@@ -286,6 +307,18 @@ inline my_spwd::~my_spwd() {
     free(sp_pwdp);
 }
 
+inline void my_spwd::set_sp_pwdp(const char * pwdp) noexcept {
+    free(sp_pwdp);
+    sp_pwdp = strdup(pwdp);
+}
+
+inline void my_spwd::set_sp_lstchg() noexcept {
+    sp_lstchg = time(nullptr) / 86400;
+    if (sp_lstchg == 0) {
+        sp_lstchg = -1;
+    }
+}
+
 inline chpasswd_context::chpasswd_context(const char * root_path)
     : passwd_path_(root_path + std::string("/etc/passwd"))
     , shadow_path_(root_path + std::string("/etc/shadow"))
@@ -304,9 +337,9 @@ inline chpasswd_context::chpasswd_context(const char * root_path)
     }
 }
 
-inline passwd * chpasswd_context::find_passwd(const char * username) {
+inline my_passwd * chpasswd_context::find_passwd(const char * username) {
     for (auto & pwd : pwds_) {
-        if (strcmp(pwd.pw_name, username) == 0) {
+        if (strcmp(pwd.get_pw_name(), username) == 0) {
             return &pwd;
         }
     }
@@ -314,9 +347,9 @@ inline passwd * chpasswd_context::find_passwd(const char * username) {
 }
 
 
-inline spwd * chpasswd_context::find_spwd(const char * username) {
+inline my_spwd * chpasswd_context::find_spwd(const char * username) {
     for (auto & spwd : spwds_) {
-        if (strcmp(spwd.sp_namp, username) == 0) {
+        if (strcmp(spwd.get_sp_namp(), username) == 0) {
             return &spwd;
         }
     }
@@ -337,7 +370,7 @@ bool chpasswd_context::write_passwd(const char * root_path) {
                         ctx->passwd_fp_.reset();
                         auto & pwds = ctx->pwds_;
                         for (auto & pwd : pwds) {
-                            if (putpwent(&pwd, fp) != 0) {
+                            if (pwd.write(fp) != 0) {
                                 return false;
                             }
                         }
@@ -353,7 +386,7 @@ bool chpasswd_context::write_shadow(const char * root_path) {
                         ctx->shadow_fp_.reset();
                         auto & spwds = ctx->spwds_;
                         for (auto & spwd : spwds) {
-                            if (putspent(&spwd, fp) != 0) {
+                            if (spwd.write(fp) != 0) {
                                 return false;
                             }
                         }
@@ -422,6 +455,9 @@ inline auto chpasswd_context::open_file_perms(
 
 bool chpasswd_context::create_backup(
     const char * root_path, const char * dst_name, FILE * src_fp, const struct stat & src_st) {
+    // 定位到文件头
+    fseek(src_fp, 0, SEEK_SET);
+
     // 打开 shadow 备份文件
     const auto backup_path = std::string(root_path) + dst_name;
     file_ptr backup_fp{open_file_perms(backup_path.c_str(), "w", src_st)};
@@ -463,7 +499,7 @@ inline bool chpasswd_context::write_file(
 
     // 写入临时文件
     if (!op(fp.get(), user)) {
-        return false;
+        goto fail;
     }
 
     // 刷新临时文件
@@ -472,10 +508,14 @@ inline bool chpasswd_context::write_file(
 
     // 重命名临时 shadow 文件
     if (rename(temp_path.c_str(), path) != 0) {
-        return false;
+        goto fail;
     }
 
     return true;
+
+fail:
+    unlink(temp_path.c_str());
+    return false;
 }
 
 bool chpasswd(const char * root_path, const char * username, const char * password) {
@@ -508,18 +548,15 @@ bool chpasswd(const char * root_path, const char * username, const char * passwo
     if (sp) {
         // 修改 shadow 文件
         update_shadow = true;
-        sp->sp_pwdp = hash;
-        sp->sp_lstchg = time(nullptr) / 86400;
-        if (sp->sp_lstchg == 0) {
-            sp->sp_lstchg = 1;
-        }
+        sp->set_sp_pwdp(hash);
+        sp->set_sp_lstchg();
     }
 
     // 更新 passwd 纪录
     bool update_passwd = false;
-    if (!sp || (strcmp(pwd->pw_passwd, "x") != 0)) {
+    if (!sp || (strcmp(pwd->get_pw_passwd(), "x") != 0)) {
         update_passwd = true;
-        pwd->pw_passwd = hash;
+        pwd->set_pw_passwd(hash);
     }
 
     // 更新 shadow 文件
