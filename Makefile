@@ -7,7 +7,6 @@ a.out: chpasswd.o test.o
 chpasswd.o: chpasswd.cpp
 	g++ -c -g3 -std=c++20 -Wall -Wextra -o $@ $<
 
-
 test.o: test.cpp
 	g++ -c -g3 -std=c++20 -Wall -Wextra -o $@ $<
 

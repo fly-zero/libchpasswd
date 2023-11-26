@@ -551,20 +551,42 @@ private:
     struct stat shadow_st_{};     ///< shadow 文件的 stat 信息
 };
 
-bool chpasswd(const char * root_path, const char * username, const char * password) {
+/**
+ * @brief 设置错误消息
+ *
+ * @param err_msg 错误消息
+ * @param format 消息格式
+ * @param ... 消息参数
+ */
+__attribute__((format(printf, 2, 3)))
+static void set_error_message(
+    char (*err_msg)[CHPASSWD_MESSAGE_LENGTH], const char * format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    vsnprintf(*err_msg, sizeof *err_msg, format, ap);
+    va_end(ap);
+}
+
+int chpasswd(
+    const char * root_path,
+    const char * username,
+    const char * password,
+    char (*err_msg)[CHPASSWD_MESSAGE_LENGTH]) {
 
     std::optional<chpasswd_context> ctx;
 
     try {
         ctx.emplace(root_path);
     } catch (std::exception const & e) {
-        return false;
+        set_error_message(err_msg, "%s", e.what());
+        return -1;
     }
 
     // 以用户名查找 pwd
     auto const pwd = ctx->find_passwd(username);
     if (!pwd) {
-        return false; // 用户不存在
+        set_error_message(err_msg, "cannot find username %s in passwd", username);
+        return -1; // 用户不存在
     }
 
     // 计算密码的 hash
@@ -583,12 +605,14 @@ bool chpasswd(const char * root_path, const char * username, const char * passwo
 
         // 创建 shadow 备份文件
         if (!ctx->create_shadow_backup(root_path)) {
-            return false;
+            set_error_message(err_msg, "cannot create shadow backup file");
+            return -1;
         }
 
         // 写新的 shadow 文件
         if (!ctx->write_shadow(root_path)) {
-            return false;
+            set_error_message(err_msg, "cannot write new shadow file");
+            return -1;
         }
     }
 
@@ -598,14 +622,16 @@ bool chpasswd(const char * root_path, const char * username, const char * passwo
 
         // 创建 passwd 备份文件
         if (!ctx->create_passwd_backup(root_path)) {
-            return false;
+            set_error_message(err_msg, "cannot create passwd backup file");
+            return -1;
         }
 
         // 写新的 passwd 文件
         if (!ctx->write_passwd(root_path)) {
-            return false;
+            set_error_message(err_msg, "cannot write new passwd file");
+            return -1;
         }
     }
 
-    return true;
+    return 0;
 }

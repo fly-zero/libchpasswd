@@ -4,6 +4,8 @@
 extern "C" {
 #endif
 
+#define CHPASSWD_MESSAGE_LENGTH 1024
+
 /**
  * @brief 修改用户密码
  *
@@ -13,7 +15,11 @@ extern "C" {
  * @return true 成功
  * @return false 失败
  */
-bool chpasswd(const char * root_path, const char * username, const char * password);
+int chpasswd(
+    const char * root_path,
+    const char * username,
+    const char * password,
+    char (*err_msg)[CHPASSWD_MESSAGE_LENGTH]);
 
 #ifdef __cplusplus
 }
