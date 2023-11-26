@@ -5,6 +5,7 @@
 #include <shadow.h>
 #include <sys/stat.h>
 
+#include <cassert>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
@@ -551,6 +552,11 @@ private:
     struct stat shadow_st_{};     ///< shadow 文件的 stat 信息
 };
 
+constexpr unsigned long B_ROUNDS_DEFAULT = 13;
+constexpr unsigned long Y_COST_DEFAULT = 5;
+constexpr unsigned long SHA_ROUNDS_DEFAULT = 5000;
+constexpr unsigned long MAX_SALT_SIZE = 100;
+
 /**
  * @brief 设置错误消息
  *
@@ -567,10 +573,100 @@ static void set_error_message(
     va_end(ap);
 }
 
+inline void set_bcrypt_salt_prefix(char * prefix, unsigned long rounds) {
+    prefix[0] = '$';
+    prefix[1] = '2';
+    prefix[2] = 'b';
+    prefix[3] = '$';
+    snprintf(prefix + 4, 4, "%2.2lu$", rounds);
+}
+
+inline void set_yescrypt_salt_prefix(char * prefix, unsigned long cost) {
+    prefix[0] = '$';
+    prefix[1] = 'y';
+    prefix[2] = '$';
+    prefix[3] = 'j';
+    if (cost < 3) {
+        prefix[4] = 0x36 + cost;
+    } else if (cost < 6) {
+        prefix[4] = 0x34 + cost;
+    } else {
+        prefix[4] = 0x3b + cost;
+    }
+    prefix[5] = cost >= 3 ? 'T' : '5';
+    prefix[6] = '$';
+    prefix[7] = 0;
+}
+
+inline void set_sha_salt_prefix(char * prefix, unsigned long rounds, int bits) {
+    assert(bits == 256 || bits == 512);
+    prefix[0] = '$';
+    prefix[1] = bits == 256 ? '5' : '6';
+    prefix[2] = '$';
+    prefix[3] = 0;
+
+    if (rounds == SHA_ROUNDS_DEFAULT) {
+        return;
+    }
+
+    snprintf(prefix + 3, 18, "rounds=%lu$", rounds);
+}
+
+inline unsigned long get_default_round(passwd_encrypt_method encrypt_method) {
+    switch (encrypt_method) {
+    case PASSWD_ENCRYPT_METHOD_MD5:
+        return 0;
+    case PASSWD_ENCRYPT_METHOD_BCRYPT:
+        return B_ROUNDS_DEFAULT;
+    case PASSWD_ENCRYPT_METHOD_YESCRYPT:
+        return Y_COST_DEFAULT;
+    case PASSWD_ENCRYPT_METHOD_SHA256:
+        return SHA_ROUNDS_DEFAULT;
+    case PASSWD_ENCRYPT_METHOD_SHA512:
+        return SHA_ROUNDS_DEFAULT;
+    case PASSWD_ENCRYPT_METHOD_DES:
+        return 0;
+    default:
+        return -1UL;
+    }
+}
+
+void set_des_salt_prefix(char * prefix) {
+    memset(prefix, '.', MAX_SALT_SIZE - 1);
+    prefix[MAX_SALT_SIZE - 1] = '\0';
+}
+
+inline bool set_salt_prefix(char * prefix, passwd_encrypt_method encrypt_method, unsigned long rounds) {
+    switch (encrypt_method) {
+    case PASSWD_ENCRYPT_METHOD_MD5:
+        strcpy(prefix, "$1$");
+        break;
+    case PASSWD_ENCRYPT_METHOD_BCRYPT:
+        set_bcrypt_salt_prefix(prefix, rounds);
+        break;
+    case PASSWD_ENCRYPT_METHOD_YESCRYPT:
+        set_yescrypt_salt_prefix(prefix, rounds);
+        break;
+    case PASSWD_ENCRYPT_METHOD_SHA256:
+        set_sha_salt_prefix(prefix, rounds, 256);
+        break;
+    case PASSWD_ENCRYPT_METHOD_SHA512:
+        set_sha_salt_prefix(prefix, rounds, 512);
+        break;
+    case PASSWD_ENCRYPT_METHOD_DES:
+        set_des_salt_prefix(prefix);
+        break;
+    default:
+        return false;
+    }
+    return true;
+}
+
 int chpasswd(
     const char * root_path,
     const char * username,
     const char * password,
+    passwd_encrypt_method encrypt_method,
     char (*err_msg)[CHPASSWD_MESSAGE_LENGTH]) {
 
     std::optional<chpasswd_context> ctx;
@@ -589,9 +685,21 @@ int chpasswd(
         return -1; // 用户不存在
     }
 
+    // 获取默认的 rounds
+    auto const rounds = get_default_round(encrypt_method);
+    if (rounds == -1UL) {
+        set_error_message(err_msg, "invalid encrypt method");
+        return -1;
+    }
+
+    // 设置 salt 前缀
+    char prefix[MAX_SALT_SIZE];
+    if (!set_salt_prefix(prefix, encrypt_method, rounds)) {
+        set_error_message(err_msg, "invalid encrypt method");
+        return -1;
+    }
+
     // 计算密码的 hash
-    char prefix[128]{"$6$"}; // SHA512
-    constexpr auto rounds = 5000;
     auto const salt = crypt_gensalt(prefix, rounds, nullptr, 0);
     auto const hash = crypt(password, salt);
 
